@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly PROGRAM=${0##*/}
+readonly SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+readonly SOURCE_HELPER="$SCRIPT_DIR/scarlett-channel-source"
+readonly CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/scarlett-channel-picker/config
+
+DEVICE_MATCH='Scarlett Solo 4th Gen'
+CHANNEL_COUNT=4
+POLL_SECONDS=2
+CHANNEL_1_NAME='Scarlett-Solo-Channel-1'
+CHANNEL_2_NAME='Scarlett-Solo-Channel-2'
+CHANNEL_3_NAME='Scarlett-Solo-Channel-3'
+CHANNEL_4_NAME='Scarlett-Solo-Channel-4'
+
+log() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; }
+
+[[ -x $SOURCE_HELPER ]] || { log "missing helper: $SOURCE_HELPER"; exit 1; }
+if [[ -r $CONFIG_FILE ]]; then
+  # This is a user-owned shell configuration installed with mode 0600.
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+[[ $CHANNEL_COUNT =~ ^[1-9][0-9]*$ ]] || { log 'CHANNEL_COUNT must be a positive integer'; exit 1; }
+[[ $POLL_SECONDS =~ ^[1-9][0-9]*$ ]] || { log 'POLL_SECONDS must be a positive integer'; exit 1; }
+
+declare -a child_pids=()
+
+stop_children() {
+  local pid
+  for pid in "${child_pids[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${child_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  child_pids=()
+}
+trap 'stop_children; exit 0' INT TERM
+trap stop_children EXIT
+
+find_device() {
+  "$SOURCE_HELPER" --list 2>/dev/null \
+    | awk -F '\t' -v needle="$DEVICE_MATCH" 'NR > 1 && index(tolower($0), tolower(needle)) { print $2; exit }'
+}
+
+start_sources() {
+  local device=$1 channel name_var name
+  log "found $device; exposing $CHANNEL_COUNT channels"
+  for ((channel=1; channel<=CHANNEL_COUNT; channel++)); do
+    name_var="CHANNEL_${channel}_NAME"
+    name=${!name_var:-Scarlett-Solo-Channel-$channel}
+    "$SOURCE_HELPER" --device "$device" --channel "$channel" --name "$name" --description "$name" &
+    child_pids+=("$!")
+  done
+}
+
+while true; do
+  device=$(find_device || true)
+  if [[ -z $device ]]; then
+    sleep "$POLL_SECONDS"
+    continue
+  fi
+
+  start_sources "$device"
+  while sleep "$POLL_SECONDS"; do
+    current_device=$(find_device || true)
+    healthy=true
+    [[ $current_device == "$device" ]] || healthy=false
+    for pid in "${child_pids[@]}"; do
+      kill -0 "$pid" 2>/dev/null || healthy=false
+    done
+    $healthy || break
+  done
+  log 'device or PipeWire graph changed; removing sources and waiting to recreate them'
+  stop_children
+done

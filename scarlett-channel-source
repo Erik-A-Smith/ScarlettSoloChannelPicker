@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly PROGRAM=${0##*/}
+
+usage() {
+  cat <<'EOF'
+Usage: scarlett-channel-source [OPTIONS]
+
+Expose one channel of a multichannel PipeWire capture device as a mono source.
+
+Options:
+  -l, --list              List compatible capture devices and exit
+  -d, --device NAME       Exact PipeWire node.name to use
+  -c, --channel NUMBER    One-based source channel (default: 2)
+  -n, --name NAME         Virtual node name (default: Scarlett-Solo-Channel-N)
+      --description TEXT  Display name (defaults to --name)
+      --latency MS        Requested loopback latency (default: 10)
+  -v, --verbose           Print the selected device and generated properties
+  -h, --help              Show this help
+
+Without --device, the first multichannel Audio/Source whose name or description
+contains "Scarlett" is selected. The process stays in the foreground; Ctrl-C
+removes the virtual source cleanly.
+EOF
+}
+
+die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
+log() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; }
+
+for command_name in pw-dump pw-loopback jq; do
+  command -v "$command_name" >/dev/null || die "required command not found: $command_name"
+done
+
+channel=2
+device_name=
+virtual_name=
+description=
+latency=10
+list_only=false
+verbose=false
+
+while (($#)); do
+  case $1 in
+    -l|--list) list_only=true; shift ;;
+    -d|--device) (($# >= 2)) || die "$1 needs a value"; device_name=$2; shift 2 ;;
+    -c|--channel) (($# >= 2)) || die "$1 needs a value"; channel=$2; shift 2 ;;
+    -n|--name) (($# >= 2)) || die "$1 needs a value"; virtual_name=$2; shift 2 ;;
+    --description) (($# >= 2)) || die "$1 needs a value"; description=$2; shift 2 ;;
+    --latency) (($# >= 2)) || die "$1 needs a value"; latency=$2; shift 2 ;;
+    -v|--verbose) verbose=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ $channel =~ ^[1-9][0-9]*$ ]] || die "channel must be a positive integer"
+[[ $latency =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || die "latency must be a positive number"
+
+dump=$(pw-dump) || die "cannot connect to PipeWire (is the user audio session running?)"
+
+# Output: node.name, description, channel count, and the advertised position map.
+nodes=$(jq -r '
+  .[]
+  | select(.type == "PipeWire:Interface:Node")
+  | .info.props as $p
+  | select($p["media.class"] == "Audio/Source")
+  | select(($p["node.virtual"] // false) != true)
+  | select((($p["audio.channels"] // 0) | tonumber) > 1)
+  | [
+      $p["node.name"],
+      ($p["node.description"] // $p["node.nick"] // $p["node.name"]),
+      (($p["audio.channels"] // 0) | tostring),
+      ($p["audio.position"] // "")
+    ] | @tsv
+' <<<"$dump")
+
+if $list_only; then
+  if [[ -z $nodes ]]; then
+    log "no multichannel physical capture sources found"
+    exit 0
+  fi
+  printf 'CHANNELS\tNODE NAME\tDESCRIPTION\tPOSITIONS\n'
+  while IFS=$'\t' read -r name desc count positions; do
+    printf '%s\t%s\t%s\t%s\n' "$count" "$name" "$desc" "${positions:-unknown}"
+  done <<<"$nodes"
+  exit 0
+fi
+
+if [[ -n $device_name ]]; then
+  selected=$(awk -F '\t' -v wanted="$device_name" '$1 == wanted { print; exit }' <<<"$nodes")
+  [[ -n $selected ]] || die "multichannel capture source not found: $device_name (try --list)"
+else
+  selected=$(awk -F '\t' 'tolower($1 " " $2) ~ /scarlett/ { print; exit }' <<<"$nodes")
+  [[ -n $selected ]] || die "no multichannel Scarlett capture source found (try --list and --device)"
+fi
+
+IFS=$'\t' read -r device_name device_description channel_count positions <<<"$selected"
+((channel <= channel_count)) || die "channel $channel is out of range; $device_description has $channel_count channels"
+[[ -n $positions ]] || die "device does not advertise audio.position; cannot map by channel safely"
+
+# audio.position is normally formatted as "[ FL, FR, RL, RR ]". Keep its
+# order: USB-interface positions are labels for channel indices, not speakers.
+position=$(sed -E 's/^\[//; s/\]$//; s/,/ /g' <<<"$positions" | awk -v n="$channel" '{ print $n }')
+[[ -n $position ]] || die "could not resolve channel $channel from audio.position=$positions"
+
+virtual_name=${virtual_name:-Scarlett-Solo-Channel-$channel}
+description=${description:-$virtual_name}
+[[ $virtual_name =~ ^[A-Za-z0-9_.-]+$ ]] || die "--name may contain only letters, digits, dot, underscore, and hyphen"
+
+capture_props=$(jq -cn \
+  --arg position "$position" \
+  '{"audio.rate":48000,"audio.channels":1,"audio.position":[$position],"stream.dont-remix":true,"node.passive":true,"node.dont-reconnect":false}')
+playback_props=$(jq -cn \
+  --arg name "$virtual_name" \
+  --arg description "$description" \
+  '{"node.name":$name,"node.description":$description,"media.class":"Audio/Source","node.virtual":true,"audio.rate":48000,"audio.channels":1,"audio.position":["MONO"]}')
+
+log "mapping channel $channel ($position) of '$device_description'"
+log "creating mono source '$description' at 48000 Hz; press Ctrl-C to remove it"
+if $verbose; then
+  log "hardware node: $device_name"
+  log "capture properties: $capture_props"
+  log "playback properties: $playback_props"
+fi
+
+exec pw-loopback \
+  --name "channel-picker-$virtual_name" \
+  --channels 1 \
+  --latency "$latency" \
+  --capture "$device_name" \
+  --capture-props "$capture_props" \
+  --playback-props "$playback_props"

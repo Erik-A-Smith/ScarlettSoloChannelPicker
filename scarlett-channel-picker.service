@@ -1,0 +1,13 @@
+[Unit]
+Description=Expose Scarlett Solo capture channels as mono PipeWire sources
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/libexec/scarlett-channel-picker/scarlett-channel-picker-daemon
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,11 @@
+# Persistent names for the four virtual microphone nodes.
+# Names may contain letters, digits, dots, underscores, and hyphens.
+CHANNEL_1_NAME='Scarlett-Solo-Channel-1'
+CHANNEL_2_NAME='Scarlett-Solo-Channel-2'
+CHANNEL_3_NAME='Scarlett-Solo-Channel-3'
+CHANNEL_4_NAME='Scarlett-Solo-Channel-4'
+
+# Case-insensitive text used to identify the physical source.
+DEVICE_MATCH='Scarlett Solo 4th Gen'
+CHANNEL_COUNT=4
+POLL_SECONDS=2
